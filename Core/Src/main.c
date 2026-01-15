@@ -14,7 +14,7 @@
  * If no LICENSE file comes with this software, it is provided AS-IS.
  *
  ******************************************************************************
- * Versao 2.4: Implementação Modbus RTU as Slave (ID:3 ) (Henrique Xavier - jan/26)
+ * Versao 2.4: Implementação Modbus RTU as Slave (Henrique Xavier - jan/26)
  * Main Branch
  */
 /* USER CODE END Header */
@@ -53,7 +53,6 @@
 #define DISPLAY_CHANNEL 'C'
 #define INPUT_MODE 'I'
 #define TYPE_MODE 'T'
-#define PROTOCOL 'R'
 #define VOLTAGE 'V'
 #define CURRENT 'A'
 #define X_MIN 'x'
@@ -68,6 +67,9 @@
 #define ACQUIRE_TENSION_VALUE 'W'
 #define ACQUIRE_CURRENT_VALUE 'Z'
 #define FLASH_CHECK 'K'
+#define PROTOCOL 'R'
+#define BAUDRATE 'B'
+#define UNIT_MEASURE 'U'
 
 // Definições RS485
 // #define BUFFERS_RX_SIZE 24
@@ -108,27 +110,27 @@ static void MX_TIM3_Init(void);
 /* USER CODE BEGIN 0 */
 
 // Variaveis das configurações
-
 char displayChannel = '1';
 char inputMode = 'D';
 char typeMode = 'A';
-char protocol = MODBUS;
 float yMin = 0.0f;
 float xMax = 20.0f;
 float xMin = 4.0f;
 float yMax = 100.0f;
 int decimalPlace = 1;
+char protocol = MODBUS;
+uint32_t baudRate = 57600;
+char unitMeasure[5] = "t";
 char msgConfigOn[15] = "CONFIG MODE ON";
 char msgConfigOff[16] = "CONFIG MODE OFF";
 char msgOk[3] = " Ok";
 
-// Filtro media movel 4-20mA
 
+// Filtro media movel 4-20mA
 float readings[NUM_READINGS]; // the readings from the analog input
 int readIndex = 0;            // the index of the current reading
 float total = 0.0f;           // the running total
 float average = 0.0f;         // the average
-
 float x, x_ant;
 
 // Variaveis main
@@ -138,6 +140,8 @@ uint8_t configMode = false;
 uint8_t analogicStrSize;
 uint8_t digitalStrSize;
 uint32_t lastSerialInterrupt;
+int lastASCIIDrawLen = -1;
+
 
 //Variaveis de controle de estado do MODBUS
 uint8_t displayIdle = 0;
@@ -145,7 +149,6 @@ uint8_t modbusWasIdle = 1;   // começa em idle
 int lastModbusCasasDecimais = -1;
 int lastDrawLen = -1;
 uint8_t modbusDataValid = 0;
-
 
 // Buffers Tx e RX - RS485 -> ASCII
 uint8_t bufferRX[BUFFERS_RX_SIZE];
@@ -164,6 +167,8 @@ typedef struct
   float yMin_f;
   float yMax_f;
   uint8_t dPlace_int;
+  uint32_t baudRate_int;
+  char unitMeasure[5];
 } DataFlashStruct;
 
 DataFlashStruct dataFlash;
@@ -251,15 +256,69 @@ double mapValue(float x, float in_min, float in_max, float out_min, float out_ma
 }
 
 // Interrupção Rx RS485
+
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
   if (huart != &huart1) return;
 
   if (protocol == MODBUS)
   {
-    if (Size < 8) goto restart_rx;
-    if (RxData[0] != SLAVE_ID) goto restart_rx;
-    if (!modbusCRC_Check(RxData, Size)) goto restart_rx;
+    /* ---------- DETECÇÃO ASCII EM MODO MODBUS ---------- */
+    /* Critérios: conter "CONFIG" OU conter '\n' (linha ASCII) */
+    uint8_t asciiDetected = 0;
+
+    /* Verifica presença de '\n' e/ou a palavra CONFIG */
+    for (uint16_t i = 0; i < Size; i++)
+    {
+      if (RxData[i] == '\n')
+      {
+        asciiDetected = 1;
+        break;
+      }
+    }
+
+    if (!asciiDetected)
+    {
+      /* Busca por "CONFIG" de forma robusta (sem assumir terminador) */
+      const char pattern[] = "CONFIG";
+      for (uint16_t i = 0; i + sizeof(pattern) - 1 <= Size; i++)
+      {
+        uint16_t j = 0;
+        while (j < (sizeof(pattern) - 1) && RxData[i + j] == (uint8_t)pattern[j]) j++;
+        if (j == (sizeof(pattern) - 1))
+        {
+          asciiDetected = 1;
+          break;
+        }
+      }
+    }
+
+    if (asciiDetected)
+    {
+      /* Copia RxData para inputString (respeitando limite e garantindo '\0') */
+      memset(inputString, 0, sizeof(inputString));
+      uint16_t w = 0;
+      for (uint16_t i = 0; i < Size && w < (BUFFERS_RX_SIZE - 1); i++)
+      {
+        if (RxData[i] == '\r') continue;     /* ignora CR */
+        if (RxData[i] == '\n') break;        /* fim de linha ASCII */
+        inputString[w++] = RxData[i];
+      }
+      inputString[w] = '\0';
+
+      /* Sinaliza para o loop principal tratar o ASCII */
+      lastSerialInterrupt = HAL_GetTick();
+      stringComplete = true;
+
+      /* Rearme a recepção e sai */
+      HAL_UARTEx_ReceiveToIdle_IT(&huart1, RxData, 256);
+      return;
+    }
+
+    /* ---------- FLUXO MODBUS NORMAL ---------- */
+    if (Size < 8) goto restart_rx;                        /* tamanho mínimo */
+    if (RxData[0] != modbusSlaveID) goto restart_rx;      /* endereço */
+    if (!modbusCRC_Check(RxData, Size)) goto restart_rx;  /* CRC */
 
     lastSerialInterrupt = HAL_GetTick();
     modbusDataValid = 1;
@@ -284,10 +343,11 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
     return;
   }
 
-  /* ---------- ASCII ---------- */
+  /* ---------- ASCII (protocolo == ASCII) ---------- */
   HAL_UARTEx_ReceiveToIdle_IT(&huart1, bufferRX, BUFFERS_RX_SIZE);
-
-  for (int i = 0; i < Size; i++)
+  memset(inputString, 0, sizeof(inputString));
+  uint16_t w = 0;
+  for (int i = 0; i < Size && w < (BUFFERS_RX_SIZE - 1); i++)
   {
     if (bufferRX[i] == '\n')
     {
@@ -295,8 +355,10 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
       stringComplete = true;
       break;
     }
-    inputString[i] = bufferRX[i];
+    if (bufferRX[i] == '\r') continue;
+    inputString[w++] = bufferRX[i];
   }
+  inputString[w] = '\0';
 }
 
 
@@ -395,16 +457,11 @@ int main(void)
   {
     readFlash++;
     displayChannel = (char)(*readFlash & 0xFF);
+    modbusSlaveID = displayChannel - '0';
     readFlash++;
     inputMode = (char)(*readFlash & 0xFF);
     readFlash++;
     typeMode = (char)(*readFlash & 0xFF);
-    readFlash++;
-    protocol = (char)(*readFlash & 0xFF);
-    if (protocol != MODBUS && protocol != ASCII)
-    {
-        protocol = MODBUS;  // fallback seguro
-    }
     readFlash++;
     xMin = *((float *)readFlash);
     readFlash += sizeof(float);
@@ -415,16 +472,35 @@ int main(void)
     yMax = *((float *)readFlash);
     readFlash += sizeof(float);
     decimalPlace = (*readFlash & 0xFF);
+    readFlash++;
+	protocol = (char)(*readFlash & 0xFF);
+	if (protocol != MODBUS && protocol != ASCII)
+	{
+		protocol = MODBUS;  // fallback seguro
+	}
+
+	readFlash++;
+	baudRate = *((uint32_t*)readFlash);
+	readFlash += sizeof(uint32_t);
+	if (baudRate == 0)
+	{
+		baudRate = 57600;  // fallback seguro
+	}
+
+	memcpy(unitMeasure, readFlash, 5);
+	readFlash += 5;
+
 
     dataFlash.displayChannel_char = displayChannel;
     dataFlash.inputMode_char = inputMode;
     dataFlash.typeMode_char = typeMode;
-    dataFlash.protocol_char = protocol;
     dataFlash.xMin_f = xMin;
     dataFlash.xMax_f = xMax;
     dataFlash.yMin_f = yMin;
     dataFlash.yMax_f = yMax;
     dataFlash.dPlace_int = decimalPlace;
+    dataFlash.protocol_char = protocol;
+    dataFlash.baudRate_int = baudRate;
   }
   else
   {
@@ -432,14 +508,18 @@ int main(void)
     dataFlash.displayChannel_char = displayChannel;
     dataFlash.inputMode_char = inputMode;
     dataFlash.typeMode_char = typeMode;
-    dataFlash.protocol_char = protocol;
     dataFlash.xMin_f = xMin;
     dataFlash.xMax_f = xMax;
     dataFlash.yMin_f = yMin;
     dataFlash.yMax_f = yMax;
     dataFlash.dPlace_int = decimalPlace;
+    dataFlash.protocol_char = protocol;
+    dataFlash.baudRate_int = baudRate;
+    strcpy(dataFlash.unitMeasure, unitMeasure);
+
     memcpy(bfdataFlash, &dataFlash, sizeof(DataFlashStruct));
     Flash_Write_Data(ADDR_FLASH_SECTOR_4, (uint32_t *)bfdataFlash, sizeof(DataFlashStruct));
+
   }
 
   // Inicializando RS485
@@ -523,27 +603,52 @@ int main(void)
           {
               if (inputString[0] == displayChannel && inputString[1] == '=')
               {
+                  int strlenASCII = 0;  // inicializa aqui
+
                   for (int count = 0; count < strlen(inputString) - 2; count++)
                   {
                       if (inputString[2 + count] == '.')
                       {
                           digitalStrSize = 3 + count + decimalPlace;
+
+                          /* proteção contra overflow */
+                          if (digitalStrSize + strlen(unitMeasure) >= BUFFERS_RX_SIZE)
+                          {
+                              // Evita crash, apenas sai sem desenhar
+                              goto ascii_exit;
+                          }
+
                           break;
                       }
                   }
 
+                  /* Limpa resto da string */
                   memset(&(inputString[digitalStrSize + 1]), 32,
                          sizeof(inputString) - digitalStrSize);
 
-                  inputString[digitalStrSize]     = 't';
+                  /* Insere unidade */
+                  for (int u = 0; u < strlen(unitMeasure); u++)
+                      inputString[digitalStrSize + u] = unitMeasure[u];
+
                   inputString[digitalStrSize - 1] = ' ';
+
+                  strlenASCII = digitalStrSize + strlen(unitMeasure);
+
+                  /* Desenha corretamente */
+          ascii_exit:
+				  if (strlenASCII != lastASCIIDrawLen)
+				  {
+					  clearScreen(true);
+					  lastASCIIDrawLen = strlenASCII;
+				  }
 
                   drawString(DISPLAY_X_OFFSET, 0,
                              &inputString[2],
-                             strlen(inputString) - 2,
+                             strlenASCII,
                              GRAPHICS_NORMAL);
               }
           }
+
 
           /* -------- CONFIG GET / SET -------- */
           if (configMode)
@@ -552,54 +657,62 @@ int main(void)
               {
                   switch (inputString[4])
                   {
-                  case DISPLAY_CHANNEL:
-                      bufferTX[0] = (uint8_t)displayChannel;
-                      transmit_RS485(bufferTX, 1);
-                      break;
-                  case INPUT_MODE:
-                      bufferTX[0] = (uint8_t)inputMode;
-                      transmit_RS485(bufferTX, 1);
-                      break;
-                  case TYPE_MODE:
-                      bufferTX[0] = (uint8_t)typeMode;
-                      transmit_RS485(bufferTX, 1);
-                      break;
-                  case PROTOCOL:
-                      bufferTX[0] = (uint8_t)protocol;
-                      transmit_RS485(bufferTX, 1);
-                      break;
-                  case X_MIN:
-                      ftoa(xMin, (char *)bufferTX, 3);
-                      transmit_RS485(bufferTX, 10);
-                      break;
-                  case X_MAX:
-                      ftoa(xMax, (char *)bufferTX, 3);
-                      transmit_RS485(bufferTX, 10);
-                      break;
-                  case Y_MIN:
-                      ftoa(yMin, (char *)bufferTX, 3);
-                      transmit_RS485(bufferTX, 10);
-                      break;
-                  case Y_MAX:
-                      ftoa(yMax, (char *)bufferTX, 3);
-                      transmit_RS485(bufferTX, 10);
-                      break;
-                  case DECIMAL_PLACE:
-                      sprintf((char *)bufferTX, "%d", decimalPlace);
-                      transmit_RS485(bufferTX, 1);
-                      break;
-                  case ACQUIRE_CURRENT_VALUE:
-                      ftoa(read_clk420mA(&hspi1,
-                           CS_420mA_GPIO_Port, CS_420mA_Pin),
-                           (char *)bufferTX, 3);
-                      transmit_RS485(bufferTX, 10);
-                      break;
-                  case ACQUIRE_TENSION_VALUE:
-                      ftoa(read_clk420mA_voltage(&hspi1,
-                           CS_420mA_GPIO_Port, CS_420mA_Pin),
-                           (char *)bufferTX, 3);
-                      transmit_RS485(bufferTX, 10);
-                      break;
+					  case DISPLAY_CHANNEL:
+						  bufferTX[0] = (uint8_t)displayChannel;
+						  transmit_RS485(bufferTX, 1);
+						  break;
+					  case INPUT_MODE:
+						  bufferTX[0] = (uint8_t)inputMode;
+						  transmit_RS485(bufferTX, 1);
+						  break;
+					  case TYPE_MODE:
+						  bufferTX[0] = (uint8_t)typeMode;
+						  transmit_RS485(bufferTX, 1);
+						  break;
+					  case X_MIN:
+						  ftoa(xMin, (char *)bufferTX, 3);
+						  transmit_RS485(bufferTX, strlen((char*)bufferTX));
+						  break;
+					  case X_MAX:
+						  ftoa(xMax, (char *)bufferTX, 3);
+						  transmit_RS485(bufferTX, strlen((char*)bufferTX));
+						  break;
+					  case Y_MIN:
+						  ftoa(yMin, (char *)bufferTX, 3);
+						  transmit_RS485(bufferTX, strlen((char*)bufferTX));
+						  break;
+					  case Y_MAX:
+						  ftoa(yMax, (char *)bufferTX, 3);
+						  transmit_RS485(bufferTX, strlen((char*)bufferTX));
+						  break;
+					  case DECIMAL_PLACE:
+						  sprintf((char *)bufferTX, "%d", decimalPlace);
+						  transmit_RS485(bufferTX, 1);
+						  break;
+					  case ACQUIRE_CURRENT_VALUE:
+						  ftoa(read_clk420mA(&hspi1,
+							   CS_420mA_GPIO_Port, CS_420mA_Pin),
+							   (char *)bufferTX, 3);
+						  transmit_RS485(bufferTX, strlen((char*)bufferTX));
+						  break;
+					  case ACQUIRE_TENSION_VALUE:
+						  ftoa(read_clk420mA_voltage(&hspi1,
+							   CS_420mA_GPIO_Port, CS_420mA_Pin),
+							   (char *)bufferTX, 3);
+						  transmit_RS485(bufferTX, strlen((char*)bufferTX));
+						  break;
+					  case PROTOCOL:
+						bufferTX[0] = (uint8_t)protocol;
+						transmit_RS485(bufferTX, 1);
+						break;
+					  case BAUDRATE:
+						sprintf((char*)bufferTX, "%lu", baudRate);
+						transmit_RS485(bufferTX, strlen((char*)bufferTX));
+						break;
+					  case UNIT_MEASURE:
+					      transmit_RS485((uint8_t*)unitMeasure, strlen(unitMeasure));
+					      break;
+
                   }
               }
               else if (strstr(inputString, "SET") != NULL)
@@ -609,6 +722,10 @@ int main(void)
                   case DISPLAY_CHANNEL:
                       displayChannel = inputString[6];
                       dataFlash.displayChannel_char = displayChannel;
+                      modbusSlaveID = displayChannel - '0';
+                      if(protocol == MODBUS)
+                              HAL_UARTEx_ReceiveToIdle_IT(&huart1, RxData, 256); //reinicia recepção modbus
+
                       break;
                   case INPUT_MODE:
                       inputMode = inputString[6];
@@ -617,10 +734,6 @@ int main(void)
                   case TYPE_MODE:
                       typeMode = inputString[6];
                       dataFlash.typeMode_char = typeMode;
-                      break;
-                  case PROTOCOL:
-                      protocol = inputString[6];
-                      dataFlash.protocol_char = protocol;
                       break;
                   case X_MIN:
                       xMin = atof(&inputString[6]);
@@ -642,6 +755,32 @@ int main(void)
                       decimalPlace = (uint8_t)(inputString[6] - '0');
                       dataFlash.dPlace_int = decimalPlace;
                       break;
+                  case PROTOCOL:
+                      if (inputString[6] == MODBUS || inputString[6] == ASCII)
+                          protocol = inputString[6];
+                      else
+                          protocol = MODBUS; // fallback
+                      dataFlash.protocol_char = protocol;
+                      MX_USART1_UART_Init();
+                      break;
+                  case BAUDRATE:
+                	   baudRate = (uint32_t)atoi(&inputString[6]);
+                	   dataFlash.baudRate_int = baudRate;
+                	   MX_USART1_UART_Init();  // reinitialize UART with new baud
+                	   break;
+                  case UNIT_MEASURE:
+                      memset(unitMeasure, 0, sizeof(unitMeasure));
+                      strncpy(unitMeasure, &inputString[6], 4);  // suporta até "t/min"
+                      dataFlash.unitMeasure[0] = '\0';
+
+                      if (strcmp(unitMeasure, "t") != 0 &&
+                          strcmp(unitMeasure, "kN") != 0 &&
+                          strcmp(unitMeasure, "t/min") != 0)
+                      {
+                          strcpy(unitMeasure, "t");
+                      }
+                      strcpy(dataFlash.unitMeasure, unitMeasure);
+                      break;
                   }
 
                   bufferTX[0] = inputString[4];
@@ -650,13 +789,9 @@ int main(void)
 
                   dataFlash.check = FLASH_CHECK;
 
-                  if (bufferTX[0] == DECIMAL_PLACE)
-                  {
-                      memcpy(bfdataFlash, &dataFlash, sizeof(DataFlashStruct));
-                      Flash_Write_Data(ADDR_FLASH_SECTOR_4,
-                                       (uint32_t *)bfdataFlash,
-                                       sizeof(DataFlashStruct));
-                  }
+				  memcpy(bfdataFlash, &dataFlash, sizeof(DataFlashStruct));
+				  Flash_Write_Data(ADDR_FLASH_SECTOR_4, (uint32_t *)bfdataFlash, sizeof(DataFlashStruct));
+
               }
           }
 
@@ -712,18 +847,16 @@ int main(void)
               }
 
               /* Acrescenta unidade */
-              tempString[len]     = 't';
-              tempString[len + 1] = '\0';
+              for (int u = 0; u < strlen(unitMeasure); u++)
+                  tempString[len + u] = unitMeasure[u];
+              tempString[len + strlen(unitMeasure)] = '\0';
 
-              drawString(DISPLAY_X_OFFSET, 0,
-                         tempString,
-                         len + 1,
-                         GRAPHICS_NORMAL);
+              int displayLen = len + strlen(unitMeasure);
+              drawString(DISPLAY_X_OFFSET, 0, tempString, displayLen, GRAPHICS_NORMAL);
 
               timer = HAL_GetTick();
           }
       }
-
 
       // MODO ANALOGICO
       if (!configMode)
@@ -782,10 +915,15 @@ int main(void)
               analogicStrSize = 5 + decimalPlace;
             }
 
-            char tempString[9];
+            char tempString[16];
             memset(tempString, ' ', sizeof(tempString));
             ftoa(value, tempString, decimalPlace);
-            tempString[analogicStrSize] = 't';
+
+            /* acrescenta unidade */
+            for (int u = 0; u < strlen(unitMeasure); u++)
+                tempString[analogicStrSize + u] = unitMeasure[u];
+
+
             drawString(DISPLAY_X_OFFSET, 0, tempString, sizeof(tempString), GRAPHICS_NORMAL);
             timer = HAL_GetTick();
           }
@@ -974,7 +1112,7 @@ static void MX_USART1_UART_Init(void)
 
   /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
-  huart1.Init.BaudRate = 57600;
+  huart1.Init.BaudRate = baudRate;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
   huart1.Init.StopBits = UART_STOPBITS_1;
   huart1.Init.Parity = UART_PARITY_NONE;

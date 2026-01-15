@@ -6,6 +6,7 @@
 #include "string.h"
 #include "stdint.h"
 
+uint8_t modbusSlaveID = 1;
 
 /* Buffers Modbus */
 uint8_t RxData[256];
@@ -64,7 +65,7 @@ uint8_t readHoldingRegs (void)
 	//| SLAVE_ID | FUNCTION_CODE | BYTE COUNT | DATA      | CRC     |
 	//| 1 BYTE   |  1 BYTE       |  1 BYTE    | N*2 BYTES | 2 BYTES |
 
-	TxData[0] = SLAVE_ID;  // slave ID
+	TxData[0] = modbusSlaveID;  // slave ID
 	TxData[1] = RxData[1];  // function code
 	TxData[2] = numRegs*2;  // Byte count
 	int indx = 3;  // we need to keep track of how many bytes has been stored in TxData Buffer
@@ -124,7 +125,7 @@ uint8_t writeHoldingRegs(void)
     }
 
     // prepara resposta (função 0x10 ecoa start addr e quantidade)
-    TxData[0] = SLAVE_ID;      // slave ID
+    TxData[0] = modbusSlaveID;      // slave ID
     TxData[1] = RxData[1];     // function code (deve ser 0x10)
     TxData[2] = RxData[2];     // Start Addr HIGH Byte
     TxData[3] = RxData[3];     // Start Addr LOW Byte

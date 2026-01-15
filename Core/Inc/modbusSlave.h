@@ -8,11 +8,11 @@
 #include "modbus_crc.h"
 #include "stm32f4xx_hal.h"
 
-#define SLAVE_ID 3
-
 #define ILLEGAL_FUNCTION       0x01
 #define ILLEGAL_DATA_ADDRESS   0x02
 #define ILLEGAL_DATA_VALUE     0x03
+
+extern uint8_t modbusSlaveID;
 
 /* Buffers Modbus */
 extern uint8_t RxData[256];

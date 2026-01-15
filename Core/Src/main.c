@@ -132,7 +132,6 @@ float average = 0.0f;         // the average
 float x, x_ant;
 
 // Variaveis main
-
 char inputString[BUFFERS_RX_SIZE];
 uint8_t stringComplete = false;
 uint8_t configMode = false;
@@ -140,10 +139,12 @@ uint8_t analogicStrSize;
 uint8_t digitalStrSize;
 uint32_t lastSerialInterrupt;
 
+//Variaveis de controle de estado do MODBUS
 uint8_t displayIdle = 0;
 uint8_t modbusWasIdle = 1;   // começa em idle
 int lastModbusCasasDecimais = -1;
 int lastDrawLen = -1;
+uint8_t modbusDataValid = 0;
 
 
 // Buffers Tx e RX - RS485 -> ASCII
@@ -261,6 +262,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
     if (!modbusCRC_Check(RxData, Size)) goto restart_rx;
 
     lastSerialInterrupt = HAL_GetTick();
+    modbusDataValid = 1;
 
     switch (RxData[1])
     {
@@ -426,8 +428,6 @@ int main(void)
   }
   else
   {
-	protocol = MODBUS;  // força 'M' na primeira gravação
-
     dataFlash.check = FLASH_CHECK;
     dataFlash.displayChannel_char = displayChannel;
     dataFlash.inputMode_char = inputMode;
@@ -669,7 +669,8 @@ int main(void)
       if (!configMode &&
           inputMode == DIGITAL &&
           protocol == MODBUS &&
-          displayIdle == 0)
+          displayIdle == 0 &&
+		  modbusDataValid)
       {
           float valueFloat = modbus_u16_to_float32_be(
                                   Holding_Registers_Database[2],

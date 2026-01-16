@@ -793,9 +793,16 @@ int main(void)
 
 						  if (strcmp(unitMeasure, "t") != 0 &&
 							  strcmp(unitMeasure, "kN") != 0 &&
-							  strcmp(unitMeasure, "Kg") != 0 &&
+							  strcmp(unitMeasure, "N") != 0 &&
+							  strcmp(unitMeasure, "kg") != 0 &&
+							  strcmp(unitMeasure, "kgf") != 0 &&
+							  strcmp(unitMeasure, "g") != 0 &&
+							  strcmp(unitMeasure, "oz") != 0 &&
+							  strcmp(unitMeasure, "lb") != 0 &&
+							  strcmp(unitMeasure, "kg/s") != 0 &&
 							  strcmp(unitMeasure, "t/min") != 0)
 						  {
+							  // Valor inválido → fallback seguro
 							  strcpy(unitMeasure, "t");
 						  }
 						  strcpy(dataFlash.unitMeasure, unitMeasure);

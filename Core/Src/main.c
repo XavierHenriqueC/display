@@ -61,13 +61,13 @@
 #define Y_MAX 'Y'
 #define DIGITAL 'D'
 #define ANALOGIC 'A'
-#define MODBUS 'M'
-#define ASCII 'S'
 #define DECIMAL_PLACE 'P'
 #define ACQUIRE_TENSION_VALUE 'W'
 #define ACQUIRE_CURRENT_VALUE 'Z'
 #define FLASH_CHECK 'K'
 #define PROTOCOL 'R'
+#define MODBUS 'M'
+#define ASCII 'S'
 #define BAUDRATE 'B'
 #define UNIT_MEASURE 'U'
 
@@ -125,34 +125,32 @@ char msgConfigOn[15] = "CONFIG MODE ON";
 char msgConfigOff[16] = "CONFIG MODE OFF";
 char msgOk[3] = " Ok";
 
+//Variaveis globais
+uint8_t digitalStrSize;
+uint32_t lastSerialInterrupt;
+uint8_t displayIdle = 0;
 
-// Filtro media movel 4-20mA
+// Variaveis de controle ASCII
+char inputString[BUFFERS_RX_SIZE];
+uint8_t stringComplete = false;
+uint8_t configMode = false;
+uint8_t bufferRX[BUFFERS_RX_SIZE];
+uint8_t bufferTX[BUFFERS_RX_SIZE];
+int lastASCIIDrawLen = -1;
+
+// Variaveis de controle - Analógica
+uint8_t analogicStrSize;
 float readings[NUM_READINGS]; // the readings from the analog input
 int readIndex = 0;            // the index of the current reading
 float total = 0.0f;           // the running total
 float average = 0.0f;         // the average
 float x, x_ant;
 
-// Variaveis main
-char inputString[BUFFERS_RX_SIZE];
-uint8_t stringComplete = false;
-uint8_t configMode = false;
-uint8_t analogicStrSize;
-uint8_t digitalStrSize;
-uint32_t lastSerialInterrupt;
-int lastASCIIDrawLen = -1;
-
-
-//Variaveis de controle de estado do MODBUS
-uint8_t displayIdle = 0;
+//Variaveis de controle MODBUS
 uint8_t modbusWasIdle = 1;   // começa em idle
 int lastModbusCasasDecimais = -1;
 int lastDrawLen = -1;
 uint8_t modbusDataValid = 0;
-
-// Buffers Tx e RX - RS485 -> ASCII
-uint8_t bufferRX[BUFFERS_RX_SIZE];
-uint8_t bufferTX[BUFFERS_RX_SIZE];
 
 // Struct para salvar os dados na flash
 typedef struct
@@ -180,7 +178,8 @@ uint32_t count_init = 0;
 const char *INIT = "HFN SENSORS v2.4"; // String de inicialização
 const char *IDLE = "- - - - - -";      // String de repouso
 
-// Transformando float em string
+// Funções Gerais
+
 char *reverse(char *str, int len)
 {
   int start = 0;
@@ -196,6 +195,7 @@ char *reverse(char *str, int len)
   return str;
 }
 
+// Transformando float em string
 void ftoa(float num, char *str, int decimalPlaces)
 {
     int i = 0;
@@ -429,7 +429,6 @@ int main(void)
   MX_GPIO_Init();
   MX_SPI1_Init();
   MX_SPI2_Init();
-  MX_USART1_UART_Init();
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
 
@@ -448,80 +447,154 @@ int main(void)
     readings[thisReading] = 0;
   }
 
-  // Inicializando os dados da EEPROM
-  uint8_t *readFlash = (uint8_t *)ADDR_FLASH_SECTOR_4;
-  dataFlash.check = (char)(*readFlash & 0xFF);
+
+  // Inicializando os dados da Flash
+
+  // Lê a struct inteira da Flash
+  memcpy(&dataFlash, (void*)ADDR_FLASH_SECTOR_4, sizeof(DataFlashStruct));
 
   if (dataFlash.check == FLASH_CHECK)
   {
-    readFlash++;
-    displayChannel = (char)(*readFlash & 0xFF);
-    modbusSlaveID = displayChannel - '0';
-    readFlash++;
-    inputMode = (char)(*readFlash & 0xFF);
-    readFlash++;
-    typeMode = (char)(*readFlash & 0xFF);
-    readFlash++;
-    xMin = *((float *)readFlash);
-    readFlash += sizeof(float);
-    xMax = *((float *)readFlash);
-    readFlash += sizeof(float);
-    yMin = *((float *)readFlash);
-    readFlash += sizeof(float);
-    yMax = *((float *)readFlash);
-    readFlash += sizeof(float);
-    decimalPlace = (*readFlash & 0xFF);
-    readFlash++;
-	protocol = (char)(*readFlash & 0xFF);
-	if (protocol != MODBUS && protocol != ASCII)
-	{
-		protocol = MODBUS;  // fallback seguro
-	}
+	  // char
+	  readFlash++;  // sai de check -> vai para displayChannel
+	  displayChannel = (char)(*readFlash & 0xFF);
+	  modbusSlaveID = (displayChannel >= '0' && displayChannel <= '9') ? (displayChannel - '0') : 1;
 
-	readFlash++;
-	baudRate = *((uint32_t*)readFlash);
-	readFlash += sizeof(uint32_t);
-	if (baudRate == 0)
-	{
-		baudRate = 57600;  // fallback seguro
-	}
+	  readFlash++;
+	  inputMode = (char)(*readFlash & 0xFF);
 
-	memcpy(unitMeasure, readFlash, 5);
-	readFlash += 5;
+	  readFlash++;
+	  typeMode = (char)(*readFlash & 0xFF);
+
+	  // float (memcpy para evitar problemas de alinhamento)
+	  readFlash++;  // avança do typeMode para o início de xMin
+	  memcpy(&xMin, readFlash, sizeof(float));
+
+	  readFlash += sizeof(float);
+	  memcpy(&xMax, readFlash, sizeof(float));
+
+	  readFlash += sizeof(float);
+	  memcpy(&yMin, readFlash, sizeof(float));
+
+	  readFlash += sizeof(float);
+	  memcpy(&yMax, readFlash, sizeof(float));
+
+	  // decimalPlace (uint8_t)
+	  readFlash += sizeof(float);
+	  decimalPlace = (*readFlash & 0xFF);
+
+	  // protocol com fallback simples
+	  readFlash++;
+	  protocol = (char)(*readFlash & 0xFF);
+	  if (protocol != MODBUS && protocol != ASCII) {
+	      protocol = MODBUS;  // fallback seguro
+	  }
+
+	  // baudRate (uint32_t) + fallback
+	  readFlash++;
+	  memcpy(&baudRate, readFlash, sizeof(uint32_t));
+	  if (!(baudRate == 1200   ||
+	        baudRate == 2400   ||
+	        baudRate == 4800   ||
+	        baudRate == 9600   ||
+	        baudRate == 19200  ||
+	        baudRate == 38400  ||
+	        baudRate == 57600  ||
+	        baudRate == 115200 ||
+	        baudRate == 230400 ||
+	        baudRate == 460800 ||
+	        baudRate == 921600))
+	  {
+	      baudRate = 57600;  // fallback seguro
+	  }
+	  readFlash += sizeof(uint32_t);  // move para início de unit
+
+	  // unitMeasure: copiar até 5 bytes e garantir '\0'
+	  memcpy(unitMeasure, readFlash, 5);
+	  unitMeasure[5] = '\0';
+	  readFlash += 5;
+
+	  // Fallback seguro de unidade
+	  if (strcmp(unitMeasure, "t")     != 0 &&
+	      strcmp(unitMeasure, "kN")    != 0 &&
+	      strcmp(unitMeasure, "N")     != 0 &&
+	      strcmp(unitMeasure, "kg")    != 0 &&
+	      strcmp(unitMeasure, "kgf")   != 0 &&
+	      strcmp(unitMeasure, "g")     != 0 &&
+	      strcmp(unitMeasure, "oz")    != 0 &&
+	      strcmp(unitMeasure, "lb")    != 0 &&
+	      strcmp(unitMeasure, "kg/s")  != 0 &&
+	      strcmp(unitMeasure, "t/min") != 0)
+	  {
+	      strcpy(unitMeasure, "t"); // fallback seguro
+	  }
 
 
-    dataFlash.displayChannel_char = displayChannel;
-    dataFlash.inputMode_char = inputMode;
-    dataFlash.typeMode_char = typeMode;
-    dataFlash.xMin_f = xMin;
-    dataFlash.xMax_f = xMax;
-    dataFlash.yMin_f = yMin;
-    dataFlash.yMax_f = yMax;
-    dataFlash.dPlace_int = decimalPlace;
-    dataFlash.protocol_char = protocol;
-    dataFlash.baudRate_int = baudRate;
-    strcpy(dataFlash.unitMeasure, unitMeasure);
-
+      // Replica para a struct
+      dataFlash.displayChannel_char = displayChannel;
+      dataFlash.inputMode_char      = inputMode;
+      dataFlash.typeMode_char       = typeMode;
+      dataFlash.xMin_f              = xMin;
+      dataFlash.xMax_f              = xMax;
+      dataFlash.yMin_f              = yMin;
+      dataFlash.yMax_f              = yMax;
+      dataFlash.dPlace_int          = decimalPlace;
+      dataFlash.protocol_char       = protocol;
+      dataFlash.baudRate_int        = baudRate;
+      strcpy(dataFlash.unitMeasure, unitMeasure);
   }
   else
   {
-    dataFlash.check = FLASH_CHECK;
-    dataFlash.displayChannel_char = displayChannel;
-    dataFlash.inputMode_char = inputMode;
-    dataFlash.typeMode_char = typeMode;
-    dataFlash.xMin_f = xMin;
-    dataFlash.xMax_f = xMax;
-    dataFlash.yMin_f = yMin;
-    dataFlash.yMax_f = yMax;
-    dataFlash.dPlace_int = decimalPlace;
-    dataFlash.protocol_char = protocol;
-    dataFlash.baudRate_int = baudRate;
-    strcpy(dataFlash.unitMeasure, unitMeasure);
+      // Primeira inicialização (usa variáveis em RAM já definidas anteriormente)
+      dataFlash.check              = FLASH_CHECK;
+      dataFlash.displayChannel_char= displayChannel;
+      dataFlash.inputMode_char     = inputMode;
+      dataFlash.typeMode_char      = typeMode;
+      dataFlash.xMin_f             = xMin;
+      dataFlash.xMax_f             = xMax;
+      dataFlash.yMin_f             = yMin;
+      dataFlash.yMax_f             = yMax;
+      dataFlash.dPlace_int         = decimalPlace;
+      dataFlash.protocol_char      = protocol;
 
-    memcpy(bfdataFlash, &dataFlash, sizeof(DataFlashStruct));
-    Flash_Write_Data(ADDR_FLASH_SECTOR_4, (uint32_t *)bfdataFlash, sizeof(DataFlashStruct));
+      // Fallbacks também aqui, por garantia:
+      if (!(baudRate == 1200   ||
+            baudRate == 2400   ||
+            baudRate == 4800   ||
+            baudRate == 9600   ||
+            baudRate == 19200  ||
+            baudRate == 38400  ||
+            baudRate == 57600  ||
+            baudRate == 115200 ||
+            baudRate == 230400 ||
+            baudRate == 460800 ||
+            baudRate == 921600))
+      {
+          baudRate = 57600;
+      }
+      dataFlash.baudRate_int = baudRate;
 
+      // unitMeasure segura
+      if (strcmp(unitMeasure, "t")    != 0 &&
+          strcmp(unitMeasure, "kN")   != 0 &&
+          strcmp(unitMeasure, "N")    != 0 &&
+          strcmp(unitMeasure, "kg")   != 0 &&
+          strcmp(unitMeasure, "kgf")  != 0 &&
+          strcmp(unitMeasure, "g")    != 0 &&
+          strcmp(unitMeasure, "oz")   != 0 &&
+          strcmp(unitMeasure, "lb")   != 0 &&
+          strcmp(unitMeasure, "kg/s") != 0 &&
+          strcmp(unitMeasure, "t/min")!= 0)
+      {
+          strcpy(unitMeasure, "t");
+      }
+      strcpy(dataFlash.unitMeasure, unitMeasure);
+
+      // Persistir a struct inteira
+      memcpy(bfdataFlash, &dataFlash, sizeof(DataFlashStruct));
+      Flash_Write_Data(ADDR_FLASH_SECTOR_4, (uint32_t *)bfdataFlash, sizeof(DataFlashStruct));
   }
+
 
   // Inicializando RS485
   MX_USART1_UART_Init();
@@ -562,7 +635,7 @@ int main(void)
     else
     {
 
-    	/* ================= TRATAMENTO DO IDDLE ================= */
+      /* ================= TRATAMENTO DO IDDLE ================= */
       uint32_t currentTime = HAL_GetTick();
       if (currentTime - lastSerialInterrupt >= SERIAL_TIMEOUT &&
           inputMode == DIGITAL)
@@ -703,16 +776,16 @@ int main(void)
 						  transmit_RS485(bufferTX, strlen((char*)bufferTX));
 						  break;
 					  case PROTOCOL:
-						bufferTX[0] = (uint8_t)protocol;
-						transmit_RS485(bufferTX, 1);
-						break;
+							bufferTX[0] = (uint8_t)protocol;
+							transmit_RS485(bufferTX, 1);
+							break;
 					  case BAUDRATE:
-						sprintf((char*)bufferTX, "%lu", baudRate);
-						transmit_RS485(bufferTX, strlen((char*)bufferTX));
-						break;
+							sprintf((char*)bufferTX, "%lu", baudRate);
+							transmit_RS485(bufferTX, strlen((char*)bufferTX));
+							break;
 					  case UNIT_MEASURE:
-					      transmit_RS485((uint8_t*)unitMeasure, strlen(unitMeasure));
-					      break;
+							transmit_RS485((uint8_t*)unitMeasure, strlen(unitMeasure));
+							break;
 
                   }
               }
@@ -723,7 +796,7 @@ int main(void)
 					  case DISPLAY_CHANNEL:
 						  displayChannel = inputString[6];
 						  dataFlash.displayChannel_char = displayChannel;
-						  modbusSlaveID = displayChannel - '0';
+						  modbusSlaveID = displayChannel - '0'; //Converte para numero inteiro
 						  if(protocol == MODBUS)
 								  HAL_UARTEx_ReceiveToIdle_IT(&huart1, RxData, 256); //reinicia recepção modbus
 
@@ -788,7 +861,7 @@ int main(void)
 						  break;
 					  case UNIT_MEASURE:
 						  memset(unitMeasure, 0, sizeof(unitMeasure));
-						  strncpy(unitMeasure, &inputString[6], 4);  // suporta até "t/min"
+						  strncpy(unitMeasure, &inputString[6], 6);  // suporta até "t/min + /0"
 						  dataFlash.unitMeasure[0] = '\0';
 
 						  if (strcmp(unitMeasure, "t") != 0 &&
@@ -860,7 +933,7 @@ int main(void)
           {
               char tempString[12];
 
-              /* Monta string SEM 't' */
+              /* Monta string */
               ftoa(valueFloat, tempString, modbusCasasDecimais);
 
               int len = strlen(tempString);

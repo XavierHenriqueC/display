@@ -74,6 +74,8 @@
 // Definições RS485
 // #define BUFFERS_RX_SIZE 24
 #define BUFFERS_RX_SIZE 48
+#define DISPLAY_UPDATE_MS 10
+
 
 // Definições 4-20mA
 #define NUM_READINGS 10 // Size of media filter
@@ -120,7 +122,7 @@ float yMax = 100.0f;
 int decimalPlace = 1;
 char protocol = MODBUS;
 uint32_t baudRate = 57600;
-char unitMeasure[5] = "t";
+char unitMeasure[6] = "t";
 char msgConfigOn[15] = "CONFIG MODE ON";
 char msgConfigOff[16] = "CONFIG MODE OFF";
 char msgOk[3] = " Ok";
@@ -154,6 +156,7 @@ int lastModbusCasasDecimais = -1;
 int lastDrawLen = -1;
 uint8_t modbusDataValid = 0;
 
+
 // Struct para salvar os dados na flash
 typedef struct
 {
@@ -168,7 +171,7 @@ typedef struct
   float yMax_f;
   uint8_t dPlace_int;
   uint32_t baudRate_int;
-  char unitMeasure[5];
+  char unitMeasure[6];
 } DataFlashStruct;
 
 DataFlashStruct dataFlash;
@@ -705,58 +708,66 @@ int main(void)
               }
           }
 
-          /* -------- ASCII DISPLAY -------- */
-          if (!configMode && inputMode == DIGITAL && protocol == ASCII)
+          /* -------- ASCII DISPLAY (robusto, igual MODBUS) -------- */
+          if (!configMode &&
+              inputMode == DIGITAL &&
+              protocol == ASCII &&
+              displayIdle == 0)
           {
               if (inputString[0] == displayChannel && inputString[1] == '=')
               {
-                  int strlenASCII = 0;  // inicializa aqui
+                  float valueFloat;
+                  char tempString[20];
 
-                  for (int count = 0; count < strlen(inputString) - 2; count++)
+                  /* Converte string para float
+                     aceita "20.2" ou "20,2" */
+                  char valueStr[16];
+                  strncpy(valueStr, &inputString[2], sizeof(valueStr) - 1);
+                  valueStr[sizeof(valueStr) - 1] = '\0';
+
+                  /* troca ',' por '.' */
+                  for (int i = 0; i < strlen(valueStr); i++)
                   {
-                      if (inputString[2 + count] == '.')
-                      {
-                          digitalStrSize = 3 + count + decimalPlace;
-
-                          /* proteção contra overflow */
-                          if (digitalStrSize + strlen(unitMeasure) >= BUFFERS_RX_SIZE)
-                          {
-                              // Evita crash, apenas sai sem desenhar
-                              goto ascii_exit;
-                          }
-
-                          break;
-                      }
+                      if (valueStr[i] == ',')
+                          valueStr[i] = '.';
                   }
 
-                  /* Limpa resto da string */
-                  memset(&(inputString[digitalStrSize + 1]), 32,
-                         sizeof(inputString) - digitalStrSize);
+                  valueFloat = atof(valueStr);
 
-                  /* Insere unidade */
+                  /* Limpa ao sair do IDLE */
+                  if (modbusWasIdle)
+                  {
+                      clearScreen(true);
+                      modbusWasIdle = 0;
+                      lastASCIIDrawLen = -1;
+                  }
+
+                  /* Monta string numérica */
+                  ftoa(valueFloat, tempString, decimalPlace);
+
+                  int len = strlen(tempString);
+
+                  /* Limpa se tamanho mudou */
+                  if (len != lastASCIIDrawLen)
+                  {
+                      clearScreen(true);
+                      lastASCIIDrawLen = len;
+                  }
+
+                  /* Acrescenta unidade */
                   for (int u = 0; u < strlen(unitMeasure); u++)
-                      inputString[digitalStrSize + u] = unitMeasure[u];
+                      tempString[len + u] = unitMeasure[u];
 
-                  inputString[digitalStrSize - 1] = ' ';
+                  tempString[len + strlen(unitMeasure)] = '\0';
 
-                  strlenASCII = digitalStrSize + strlen(unitMeasure);
-
-                  /* Desenha corretamente */
-          ascii_exit:
-				  if (strlenASCII != lastASCIIDrawLen)
-				  {
-					  clearScreen(true);
-					  lastASCIIDrawLen = strlenASCII;
-				  }
+                  int displayLen = len + strlen(unitMeasure);
 
                   drawString(DISPLAY_X_OFFSET, 0,
-                             &inputString[2],
-                             strlenASCII,
+                             tempString,
+                             displayLen,
                              GRAPHICS_NORMAL);
               }
           }
-
-
 
           /* -------- CONFIG GET / SET -------- */
           if (configMode)
@@ -1021,7 +1032,7 @@ int main(void)
               lastDrawLen = -1;
           }
 
-          if ((timer + 200) < HAL_GetTick())
+          if ((timer + DISPLAY_UPDATE_MS) < HAL_GetTick())
           {
               char tempString[12];
 

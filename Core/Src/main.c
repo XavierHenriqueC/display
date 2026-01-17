@@ -180,6 +180,7 @@ uint32_t count_init = 0;
 const char *INIT = "HFN SENSORS v2.4"; // String de inicialização
 const char *IDLE = "- - - - - -";      // String de repouso
 
+
 // Funções Gerais
 
 char *reverse(char *str, int len)
@@ -342,7 +343,10 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
   inputString[w] = '\0';
 
   restart_rx:
-      HAL_UARTEx_ReceiveToIdle_IT(&huart1, RxData, 256);
+	if (huart1.RxState != HAL_UART_STATE_BUSY_RX)
+	{
+	  HAL_UARTEx_ReceiveToIdle_IT(&huart1, RxData, 256);
+	}
       return;
 }
 
@@ -362,6 +366,7 @@ void transmit_RS485(uint8_t *dataTx, uint16_t Size)
     HAL_UARTEx_ReceiveToIdle_IT(&huart1, RxData, 256);
   else
     HAL_UARTEx_ReceiveToIdle_IT(&huart1, bufferRX, BUFFERS_RX_SIZE);
+
 }
 
 
@@ -381,6 +386,37 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
   scanDisplayBySPI(&hspi2);
 }
+
+void RS485_ResetCommunication(void)
+{
+    // Aborta RX/TX pendentes
+    HAL_UART_AbortReceive(&huart1);
+    HAL_UART_AbortTransmit(&huart1);
+
+    // Garante RS485 em modo recepção
+    HAL_GPIO_WritePin(DE_RS485_GPIO_Port, DE_RS485_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(RE_RS485_GPIO_Port, RE_RS485_Pin, GPIO_PIN_RESET);
+
+    // Reset completo da UART
+    HAL_UART_DeInit(&huart1);
+    HAL_Delay(2);
+    MX_USART1_UART_Init();
+
+    // Limpa buffers
+    memset(bufferRX, 0, sizeof(bufferRX));
+    memset(RxData, 0, sizeof(RxData));
+    memset(inputString, 0, sizeof(inputString));
+
+    stringComplete = false;
+    modbusDataValid = 0;
+
+    // Rearma recepção
+    if (protocol == MODBUS)
+        HAL_UARTEx_ReceiveToIdle_IT(&huart1, RxData, 256);
+    else
+        HAL_UARTEx_ReceiveToIdle_IT(&huart1, bufferRX, BUFFERS_RX_SIZE);
+}
+
 
 /* USER CODE END 0 */
 
@@ -614,7 +650,11 @@ int main(void)
   while (1)
   {
     /* USER CODE END WHILE */
-
+	  if (!configMode && (HAL_GetTick() - lastSerialInterrupt) > SERIAL_TIMEOUT)
+	  {
+	      RS485_ResetCommunication();
+	      lastSerialInterrupt = HAL_GetTick();
+	  }
     /* USER CODE BEGIN 3 */
 
     if (fw_init)
@@ -810,6 +850,7 @@ int main(void)
 
                           modbusSlaveID = displayChannel - '0';
                           dataFlash.displayChannel_char = displayChannel;
+                          lastSerialInterrupt = HAL_GetTick();
                           break;
 
                       case INPUT_MODE:
@@ -818,6 +859,7 @@ int main(void)
                               inputMode = DIGITAL;
 
                           dataFlash.inputMode_char = inputMode;
+                          lastSerialInterrupt = HAL_GetTick();
                           break;
 
                       case TYPE_MODE:
@@ -826,26 +868,31 @@ int main(void)
                               typeMode = CURRENT;
 
                           dataFlash.typeMode_char = typeMode;
+                          lastSerialInterrupt = HAL_GetTick();
                           break;
 
                       case X_MIN:
                           xMin = atof(&inputString[6]);
                           dataFlash.xMin_f = xMin;
+                          lastSerialInterrupt = HAL_GetTick();
                           break;
 
                       case X_MAX:
                           xMax = atof(&inputString[6]);
                           dataFlash.xMax_f = xMax;
+                          lastSerialInterrupt = HAL_GetTick();
                           break;
 
                       case Y_MIN:
                           yMin = atof(&inputString[6]);
                           dataFlash.yMin_f = yMin;
+                          lastSerialInterrupt = HAL_GetTick();
                           break;
 
                       case Y_MAX:
                           yMax = atof(&inputString[6]);
                           dataFlash.yMax_f = yMax;
+                          lastSerialInterrupt = HAL_GetTick();
                           break;
 
                       case DECIMAL_PLACE:
@@ -854,6 +901,7 @@ int main(void)
                               decimalPlace = 1;
 
                           dataFlash.dPlace_int = decimalPlace;
+                          lastSerialInterrupt = HAL_GetTick();
                           break;
 
                       case PROTOCOL:
@@ -864,6 +912,7 @@ int main(void)
 
                           dataFlash.protocol_char = protocol;
                           needProtocolSwitch = 1;
+                          lastSerialInterrupt = HAL_GetTick();
                           break;
 
                       case BAUDRATE:
@@ -882,6 +931,7 @@ int main(void)
 
                           dataFlash.baudRate_int = baudRate;
                           needUartReinit = 1;
+                          lastSerialInterrupt = HAL_GetTick();
                           break;
 
                       case UNIT_MEASURE:
@@ -903,6 +953,7 @@ int main(void)
                           }
 
                           strcpy(dataFlash.unitMeasure, unitMeasure);
+                          lastSerialInterrupt = HAL_GetTick();
                           break;
                   }
 
@@ -925,7 +976,7 @@ int main(void)
           memset(inputString, 0, sizeof(inputString));
           stringComplete = false;
 
-          if (needUartReinit || needProtocolSwitch)
+          if ((needUartReinit || needProtocolSwitch) && !configMode)
           {
               HAL_UART_DeInit(&huart1);
               MX_USART1_UART_Init();
@@ -1069,6 +1120,16 @@ int main(void)
           }
         }
       }
+
+      if (protocol == MODBUS)
+      {
+          HAL_UARTEx_ReceiveToIdle_IT(&huart1, RxData, 256);
+      }
+      else
+      {
+          HAL_UARTEx_ReceiveToIdle_IT(&huart1, bufferRX, BUFFERS_RX_SIZE);
+      }
+
       }
     }
   }

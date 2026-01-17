@@ -129,6 +129,8 @@ char msgOk[3] = " Ok";
 uint8_t digitalStrSize;
 uint32_t lastSerialInterrupt;
 uint8_t displayIdle = 0;
+uint8_t needUartReinit = 0;
+uint8_t needProtocolSwitch = 0;
 
 // Variaveis de controle ASCII
 char inputString[BUFFERS_RX_SIZE];
@@ -266,7 +268,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
     /* Critérios: conter "CONFIG" OU conter '\n' (linha ASCII) */
     uint8_t asciiDetected = 0;
 
-    /* Verifica presença de '\n' e/ou a palavra CONFIG */
+    /* Verifica presença de '\n' */
     for (uint16_t i = 0; i < Size; i++)
     {
       if (RxData[i] == '\n')
@@ -276,21 +278,6 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
       }
     }
 
-    if (!asciiDetected)
-    {
-      /* Busca por "CONFIG" de forma robusta (sem assumir terminador) */
-      const char pattern[] = "CONFIG";
-      for (uint16_t i = 0; i + sizeof(pattern) - 1 <= Size; i++)
-      {
-        uint16_t j = 0;
-        while (j < (sizeof(pattern) - 1) && RxData[i + j] == (uint8_t)pattern[j]) j++;
-        if (j == (sizeof(pattern) - 1))
-        {
-          asciiDetected = 1;
-          break;
-        }
-      }
-    }
 
     if (asciiDetected)
     {
@@ -310,8 +297,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
       stringComplete = true;
 
       /* Rearma a recepção e sai */
-      HAL_UARTEx_ReceiveToIdle_IT(&huart1, RxData, 256);
-      return;
+      goto restart_rx;
     }
 
     /* ---------- FLUXO MODBUS NORMAL ---------- */
@@ -336,10 +322,6 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
         modbusException(ILLEGAL_FUNCTION);
         break;
     }
-
-    restart_rx:
-    HAL_UARTEx_ReceiveToIdle_IT(&huart1, RxData, 256);
-    return;
   }
 
   /* ---------- ASCII (protocolo == ASCII) ---------- */
@@ -358,6 +340,10 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
     inputString[w++] = bufferRX[i];
   }
   inputString[w] = '\0';
+
+  restart_rx:
+      HAL_UARTEx_ReceiveToIdle_IT(&huart1, RxData, 256);
+      return;
 }
 
 
@@ -448,152 +434,159 @@ int main(void)
   }
 
 
-  // Inicializando os dados da Flash
+  /* ===================== INICIALIZAÇÃO DOS DADOS DA FLASH ===================== */
 
-  // Lê a struct inteira da Flash
-  memcpy(&dataFlash, (void*)ADDR_FLASH_SECTOR_4, sizeof(DataFlashStruct));
+  uint8_t needFlashUpdate = 0;
 
-  if (dataFlash.check == FLASH_CHECK)
+  /* Ponteiro direto para a struct gravada na Flash */
+  DataFlashStruct *flashData = (DataFlashStruct *)ADDR_FLASH_SECTOR_4;
+
+  /* ------------------ CASO FLASH VÁLIDA ------------------ */
+  if (flashData->check == FLASH_CHECK)
   {
-	  // char
-	  readFlash++;  // sai de check -> vai para displayChannel
-	  displayChannel = (char)(*readFlash & 0xFF);
-	  modbusSlaveID = (displayChannel >= '0' && displayChannel <= '9') ? (displayChannel - '0') : 1;
+      /* Copia bruta da Flash para RAM */
+      dataFlash = *flashData;
 
-	  readFlash++;
-	  inputMode = (char)(*readFlash & 0xFF);
+      /* -------- Display Channel -------- */
+      displayChannel = dataFlash.displayChannel_char;
+      if (displayChannel < '0' || displayChannel > '9')
+      {
+          displayChannel = '1';
+          needFlashUpdate = 1;
+      }
+      modbusSlaveID = displayChannel - '0';
 
-	  readFlash++;
-	  typeMode = (char)(*readFlash & 0xFF);
+      /* -------- Input Mode -------- */
+      inputMode = dataFlash.inputMode_char;
+      if (inputMode != DIGITAL && inputMode != ANALOGIC)
+      {
+          inputMode = DIGITAL;
+          needFlashUpdate = 1;
+      }
 
-	  // float (memcpy para evitar problemas de alinhamento)
-	  readFlash++;  // avança do typeMode para o início de xMin
-	  memcpy(&xMin, readFlash, sizeof(float));
+      /* -------- Type Mode -------- */
+      typeMode = dataFlash.typeMode_char;
+      if (typeMode != CURRENT && typeMode != VOLTAGE)
+      {
+          typeMode = CURRENT;
+          needFlashUpdate = 1;
+      }
 
-	  readFlash += sizeof(float);
-	  memcpy(&xMax, readFlash, sizeof(float));
+      /* -------- Protocol -------- */
+      protocol = dataFlash.protocol_char;
+      if (protocol != MODBUS && protocol != ASCII)
+      {
+          protocol = MODBUS;
+          needFlashUpdate = 1;
+      }
 
-	  readFlash += sizeof(float);
-	  memcpy(&yMin, readFlash, sizeof(float));
+      /* -------- Limites X/Y -------- */
+      xMin = dataFlash.xMin_f;
+      xMax = dataFlash.xMax_f;
+      yMin = dataFlash.yMin_f;
+      yMax = dataFlash.yMax_f;
 
-	  readFlash += sizeof(float);
-	  memcpy(&yMax, readFlash, sizeof(float));
+      if (xMin >= xMax)
+      {
+          xMin = 4.0f;
+          xMax = 20.0f;
+          needFlashUpdate = 1;
+      }
 
-	  // decimalPlace (uint8_t)
-	  readFlash += sizeof(float);
-	  decimalPlace = (*readFlash & 0xFF);
+      if (yMin >= yMax)
+      {
+          yMin = 0.0f;
+          yMax = 100.0f;
+          needFlashUpdate = 1;
+      }
 
-	  // protocol com fallback simples
-	  readFlash++;
-	  protocol = (char)(*readFlash & 0xFF);
-	  if (protocol != MODBUS && protocol != ASCII) {
-	      protocol = MODBUS;  // fallback seguro
-	  }
+      /* -------- Casas Decimais -------- */
+      decimalPlace = dataFlash.dPlace_int;
+      if (decimalPlace > 4)
+      {
+          decimalPlace = 1;
+          needFlashUpdate = 1;
+      }
 
-	  // baudRate (uint32_t) + fallback
-	  readFlash++;
-	  memcpy(&baudRate, readFlash, sizeof(uint32_t));
-	  if (!(baudRate == 1200   ||
-	        baudRate == 2400   ||
-	        baudRate == 4800   ||
-	        baudRate == 9600   ||
-	        baudRate == 19200  ||
-	        baudRate == 38400  ||
-	        baudRate == 57600  ||
-	        baudRate == 115200 ||
-	        baudRate == 230400 ||
-	        baudRate == 460800 ||
-	        baudRate == 921600))
-	  {
-	      baudRate = 57600;  // fallback seguro
-	  }
-	  readFlash += sizeof(uint32_t);  // move para início de unit
+      /* -------- Baudrate -------- */
+      baudRate = dataFlash.baudRate_int;
+      switch (baudRate)
+      {
+          case 1200: case 2400: case 4800: case 9600:
+          case 19200: case 38400: case 57600:
+          case 115200: case 230400: case 460800:
+          case 921600:
+              break;
+          default:
+              baudRate = 57600;
+              needFlashUpdate = 1;
+              break;
+      }
 
-	  // unitMeasure: copiar até 5 bytes e garantir '\0'
-	  memcpy(unitMeasure, readFlash, 5);
-	  unitMeasure[5] = '\0';
-	  readFlash += 5;
+      /* -------- Unidade de Medida -------- */
+      strncpy(unitMeasure, dataFlash.unitMeasure, sizeof(unitMeasure) - 1);
+      unitMeasure[sizeof(unitMeasure) - 1] = '\0';
 
-	  // Fallback seguro de unidade
-	  if (strcmp(unitMeasure, "t")     != 0 &&
-	      strcmp(unitMeasure, "kN")    != 0 &&
-	      strcmp(unitMeasure, "N")     != 0 &&
-	      strcmp(unitMeasure, "kg")    != 0 &&
-	      strcmp(unitMeasure, "kgf")   != 0 &&
-	      strcmp(unitMeasure, "g")     != 0 &&
-	      strcmp(unitMeasure, "oz")    != 0 &&
-	      strcmp(unitMeasure, "lb")    != 0 &&
-	      strcmp(unitMeasure, "kg/s")  != 0 &&
-	      strcmp(unitMeasure, "t/min") != 0)
-	  {
-	      strcpy(unitMeasure, "t"); // fallback seguro
-	  }
+      if (strcmp(unitMeasure, "t")     != 0 &&
+          strcmp(unitMeasure, "kN")    != 0 &&
+          strcmp(unitMeasure, "N")     != 0 &&
+          strcmp(unitMeasure, "kg")    != 0 &&
+          strcmp(unitMeasure, "kgf")   != 0 &&
+          strcmp(unitMeasure, "g")     != 0 &&
+          strcmp(unitMeasure, "oz")    != 0 &&
+          strcmp(unitMeasure, "lb")    != 0 &&
+          strcmp(unitMeasure, "kg/s")  != 0 &&
+          strcmp(unitMeasure, "t/min") != 0)
+      {
+          strcpy(unitMeasure, "t");
+          needFlashUpdate = 1;
+      }
 
-
-      // Replica para a struct
+      /* -------- Atualiza struct em RAM -------- */
       dataFlash.displayChannel_char = displayChannel;
       dataFlash.inputMode_char      = inputMode;
       dataFlash.typeMode_char       = typeMode;
+      dataFlash.protocol_char       = protocol;
       dataFlash.xMin_f              = xMin;
       dataFlash.xMax_f              = xMax;
       dataFlash.yMin_f              = yMin;
       dataFlash.yMax_f              = yMax;
       dataFlash.dPlace_int          = decimalPlace;
-      dataFlash.protocol_char       = protocol;
       dataFlash.baudRate_int        = baudRate;
       strcpy(dataFlash.unitMeasure, unitMeasure);
+
+      /* -------- Regrava Flash se houve correção -------- */
+      if (needFlashUpdate)
+      {
+          memcpy(bfdataFlash, &dataFlash, sizeof(DataFlashStruct));
+          Flash_Write_Data(ADDR_FLASH_SECTOR_4,
+                           (uint32_t *)bfdataFlash,
+                           sizeof(DataFlashStruct));
+      }
   }
+  /* ------------------ PRIMEIRA INICIALIZAÇÃO ------------------ */
   else
   {
-      // Primeira inicialização (usa variáveis em RAM já definidas anteriormente)
-      dataFlash.check              = FLASH_CHECK;
-      dataFlash.displayChannel_char= displayChannel;
-      dataFlash.inputMode_char     = inputMode;
-      dataFlash.typeMode_char      = typeMode;
-      dataFlash.xMin_f             = xMin;
-      dataFlash.xMax_f             = xMax;
-      dataFlash.yMin_f             = yMin;
-      dataFlash.yMax_f             = yMax;
-      dataFlash.dPlace_int         = decimalPlace;
-      dataFlash.protocol_char      = protocol;
+      dataFlash.check               = FLASH_CHECK;
+      dataFlash.displayChannel_char = displayChannel;
+      dataFlash.inputMode_char      = inputMode;
+      dataFlash.typeMode_char       = typeMode;
+      dataFlash.protocol_char       = protocol;
+      dataFlash.xMin_f              = xMin;
+      dataFlash.xMax_f              = xMax;
+      dataFlash.yMin_f              = yMin;
+      dataFlash.yMax_f              = yMax;
+      dataFlash.dPlace_int          = decimalPlace;
+      dataFlash.baudRate_int        = baudRate;
 
-      // Fallbacks também aqui, por garantia:
-      if (!(baudRate == 1200   ||
-            baudRate == 2400   ||
-            baudRate == 4800   ||
-            baudRate == 9600   ||
-            baudRate == 19200  ||
-            baudRate == 38400  ||
-            baudRate == 57600  ||
-            baudRate == 115200 ||
-            baudRate == 230400 ||
-            baudRate == 460800 ||
-            baudRate == 921600))
-      {
-          baudRate = 57600;
-      }
-      dataFlash.baudRate_int = baudRate;
-
-      // unitMeasure segura
-      if (strcmp(unitMeasure, "t")    != 0 &&
-          strcmp(unitMeasure, "kN")   != 0 &&
-          strcmp(unitMeasure, "N")    != 0 &&
-          strcmp(unitMeasure, "kg")   != 0 &&
-          strcmp(unitMeasure, "kgf")  != 0 &&
-          strcmp(unitMeasure, "g")    != 0 &&
-          strcmp(unitMeasure, "oz")   != 0 &&
-          strcmp(unitMeasure, "lb")   != 0 &&
-          strcmp(unitMeasure, "kg/s") != 0 &&
-          strcmp(unitMeasure, "t/min")!= 0)
-      {
-          strcpy(unitMeasure, "t");
-      }
       strcpy(dataFlash.unitMeasure, unitMeasure);
 
-      // Persistir a struct inteira
       memcpy(bfdataFlash, &dataFlash, sizeof(DataFlashStruct));
-      Flash_Write_Data(ADDR_FLASH_SECTOR_4, (uint32_t *)bfdataFlash, sizeof(DataFlashStruct));
+      Flash_Write_Data(ADDR_FLASH_SECTOR_4,
+                       (uint32_t *)bfdataFlash,
+                       sizeof(DataFlashStruct));
   }
+
 
 
   // Inicializando RS485
@@ -724,179 +717,227 @@ int main(void)
           }
 
 
+
           /* -------- CONFIG GET / SET -------- */
           if (configMode)
           {
+              /* ================= GET ================= */
               if (strstr(inputString, "GET") != NULL)
               {
+                  memset(bufferTX, 0, sizeof(bufferTX));
+
                   switch (inputString[4])
                   {
-					  case DISPLAY_CHANNEL:
-						  bufferTX[0] = (uint8_t)displayChannel;
-						  transmit_RS485(bufferTX, 1);
-						  break;
-					  case INPUT_MODE:
-						  bufferTX[0] = (uint8_t)inputMode;
-						  transmit_RS485(bufferTX, 1);
-						  break;
-					  case TYPE_MODE:
-						  bufferTX[0] = (uint8_t)typeMode;
-						  transmit_RS485(bufferTX, 1);
-						  break;
-					  case X_MIN:
-						  ftoa(xMin, (char *)bufferTX, 3);
-						  transmit_RS485(bufferTX, strlen((char*)bufferTX));
-						  break;
-					  case X_MAX:
-						  ftoa(xMax, (char *)bufferTX, 3);
-						  transmit_RS485(bufferTX, strlen((char*)bufferTX));
-						  break;
-					  case Y_MIN:
-						  ftoa(yMin, (char *)bufferTX, 3);
-						  transmit_RS485(bufferTX, strlen((char*)bufferTX));
-						  break;
-					  case Y_MAX:
-						  ftoa(yMax, (char *)bufferTX, 3);
-						  transmit_RS485(bufferTX, strlen((char*)bufferTX));
-						  break;
-					  case DECIMAL_PLACE:
-						  sprintf((char *)bufferTX, "%d", decimalPlace);
-						  transmit_RS485(bufferTX, 1);
-						  break;
-					  case ACQUIRE_CURRENT_VALUE:
-						  ftoa(read_clk420mA(&hspi1,
-							   CS_420mA_GPIO_Port, CS_420mA_Pin),
-							   (char *)bufferTX, 3);
-						  transmit_RS485(bufferTX, strlen((char*)bufferTX));
-						  break;
-					  case ACQUIRE_TENSION_VALUE:
-						  ftoa(read_clk420mA_voltage(&hspi1,
-							   CS_420mA_GPIO_Port, CS_420mA_Pin),
-							   (char *)bufferTX, 3);
-						  transmit_RS485(bufferTX, strlen((char*)bufferTX));
-						  break;
-					  case PROTOCOL:
-							bufferTX[0] = (uint8_t)protocol;
-							transmit_RS485(bufferTX, 1);
-							break;
-					  case BAUDRATE:
-							sprintf((char*)bufferTX, "%lu", baudRate);
-							transmit_RS485(bufferTX, strlen((char*)bufferTX));
-							break;
-					  case UNIT_MEASURE:
-							transmit_RS485((uint8_t*)unitMeasure, strlen(unitMeasure));
-							break;
+                      case DISPLAY_CHANNEL:
+                          bufferTX[0] = displayChannel;
+                          transmit_RS485(bufferTX, 1);
+                          break;
 
+                      case INPUT_MODE:
+                          bufferTX[0] = inputMode;
+                          transmit_RS485(bufferTX, 1);
+                          break;
+
+                      case TYPE_MODE:
+                          bufferTX[0] = typeMode;
+                          transmit_RS485(bufferTX, 1);
+                          break;
+
+                      case X_MIN:
+                          ftoa(xMin, (char *)bufferTX, 3);
+                          transmit_RS485(bufferTX, strlen((char *)bufferTX));
+                          break;
+
+                      case X_MAX:
+                          ftoa(xMax, (char *)bufferTX, 3);
+                          transmit_RS485(bufferTX, strlen((char *)bufferTX));
+                          break;
+
+                      case Y_MIN:
+                          ftoa(yMin, (char *)bufferTX, 3);
+                          transmit_RS485(bufferTX, strlen((char *)bufferTX));
+                          break;
+
+                      case Y_MAX:
+                          ftoa(yMax, (char *)bufferTX, 3);
+                          transmit_RS485(bufferTX, strlen((char *)bufferTX));
+                          break;
+
+                      case DECIMAL_PLACE:
+                          sprintf((char *)bufferTX, "%d", decimalPlace);
+                          transmit_RS485(bufferTX, strlen((char *)bufferTX));
+                          break;
+
+                      case ACQUIRE_CURRENT_VALUE:
+                          ftoa(read_clk420mA(&hspi1,
+                                             CS_420mA_GPIO_Port, CS_420mA_Pin),
+                               (char *)bufferTX, 3);
+                          transmit_RS485(bufferTX, strlen((char *)bufferTX));
+                          break;
+
+                      case ACQUIRE_TENSION_VALUE:
+                          ftoa(read_clk420mA_voltage(&hspi1,
+                                             CS_420mA_GPIO_Port, CS_420mA_Pin),
+                               (char *)bufferTX, 3);
+                          transmit_RS485(bufferTX, strlen((char *)bufferTX));
+                          break;
+
+                      case PROTOCOL:
+                          bufferTX[0] = protocol;
+                          transmit_RS485(bufferTX, 1);
+                          break;
+
+                      case BAUDRATE:
+                          sprintf((char *)bufferTX, "%lu", baudRate);
+                          transmit_RS485(bufferTX, strlen((char *)bufferTX));
+                          break;
+
+                      case UNIT_MEASURE:
+                          transmit_RS485((uint8_t *)unitMeasure, strlen(unitMeasure));
+                          break;
                   }
               }
+
+              /* ================= SET ================= */
               else if (strstr(inputString, "SET") != NULL)
               {
                   switch (inputString[4])
                   {
-					  case DISPLAY_CHANNEL:
-						  displayChannel = inputString[6];
-						  dataFlash.displayChannel_char = displayChannel;
-						  modbusSlaveID = displayChannel - '0'; //Converte para numero inteiro
-						  if(protocol == MODBUS)
-								  HAL_UARTEx_ReceiveToIdle_IT(&huart1, RxData, 256); //reinicia recepção modbus
+                      case DISPLAY_CHANNEL:
+                          displayChannel = inputString[6];
+                          if (displayChannel < '0' || displayChannel > '9')
+                              displayChannel = '1';
 
-						  break;
-					  case INPUT_MODE:
-						  inputMode = inputString[6];
-						  dataFlash.inputMode_char = inputMode;
-						  break;
-					  case TYPE_MODE:
-						  typeMode = inputString[6];
-						  dataFlash.typeMode_char = typeMode;
-						  break;
-					  case X_MIN:
-						  xMin = atof(&inputString[6]);
-						  dataFlash.xMin_f = xMin;
-						  break;
-					  case X_MAX:
-						  xMax = atof(&inputString[6]);
-						  dataFlash.xMax_f = xMax;
-						  break;
-					  case Y_MIN:
-						  yMin = atof(&inputString[6]);
-						  dataFlash.yMin_f = yMin;
-						  break;
-					  case Y_MAX:
-						  yMax = atof(&inputString[6]);
-						  dataFlash.yMax_f = yMax;
-						  break;
-					  case DECIMAL_PLACE:
-						  decimalPlace = (uint8_t)(inputString[6] - '0');
-						  dataFlash.dPlace_int = decimalPlace;
-						  break;
-					  case PROTOCOL:
-						  if (inputString[6] == MODBUS || inputString[6] == ASCII)
-							  protocol = inputString[6];
-						  else
-							  protocol = MODBUS; // fallback
-						  dataFlash.protocol_char = protocol;
-						  MX_USART1_UART_Init();
-						  break;
-					  case BAUDRATE:
-						  // Converte o valor ASCII recebido
-						  baudRate = (uint32_t)atoi(&inputString[6]);
-						  // Lista baudrates aceitos
-						  if (baudRate != 1200   &&
-							  baudRate != 2400   &&
-							  baudRate != 4800   &&
-							  baudRate != 9600   &&
-							  baudRate != 19200  &&
-							  baudRate != 38400  &&
-							  baudRate != 57600  &&
-							  baudRate != 115200 &&
-							  baudRate != 230400 &&
-							  baudRate != 460800 &&
-							  baudRate != 921600)
-						  {
-						    // Valor inválido → fallback seguro
-						    baudRate = 57600;
-						  }
-						  dataFlash.baudRate_int = baudRate;
-						  MX_USART1_UART_Init();   // reinicializa UART com o baudrate validado
-						  break;
-					  case UNIT_MEASURE:
-						  memset(unitMeasure, 0, sizeof(unitMeasure));
-						  strncpy(unitMeasure, &inputString[6], 6);  // suporta até "t/min + /0"
-						  dataFlash.unitMeasure[0] = '\0';
+                          modbusSlaveID = displayChannel - '0';
+                          dataFlash.displayChannel_char = displayChannel;
+                          break;
 
-						  if (strcmp(unitMeasure, "t") != 0 &&
-							  strcmp(unitMeasure, "kN") != 0 &&
-							  strcmp(unitMeasure, "N") != 0 &&
-							  strcmp(unitMeasure, "kg") != 0 &&
-							  strcmp(unitMeasure, "kgf") != 0 &&
-							  strcmp(unitMeasure, "g") != 0 &&
-							  strcmp(unitMeasure, "oz") != 0 &&
-							  strcmp(unitMeasure, "lb") != 0 &&
-							  strcmp(unitMeasure, "kg/s") != 0 &&
-							  strcmp(unitMeasure, "t/min") != 0)
-						  {
-							  // Valor inválido → fallback seguro
-							  strcpy(unitMeasure, "t");
-						  }
-						  strcpy(dataFlash.unitMeasure, unitMeasure);
-						  break;
+                      case INPUT_MODE:
+                          inputMode = inputString[6];
+                          if (inputMode != DIGITAL && inputMode != ANALOGIC)
+                              inputMode = DIGITAL;
+
+                          dataFlash.inputMode_char = inputMode;
+                          break;
+
+                      case TYPE_MODE:
+                          typeMode = inputString[6];
+                          if (typeMode != CURRENT && typeMode != VOLTAGE)
+                              typeMode = CURRENT;
+
+                          dataFlash.typeMode_char = typeMode;
+                          break;
+
+                      case X_MIN:
+                          xMin = atof(&inputString[6]);
+                          dataFlash.xMin_f = xMin;
+                          break;
+
+                      case X_MAX:
+                          xMax = atof(&inputString[6]);
+                          dataFlash.xMax_f = xMax;
+                          break;
+
+                      case Y_MIN:
+                          yMin = atof(&inputString[6]);
+                          dataFlash.yMin_f = yMin;
+                          break;
+
+                      case Y_MAX:
+                          yMax = atof(&inputString[6]);
+                          dataFlash.yMax_f = yMax;
+                          break;
+
+                      case DECIMAL_PLACE:
+                          decimalPlace = (uint8_t)(inputString[6] - '0');
+                          if (decimalPlace > 4)
+                              decimalPlace = 1;
+
+                          dataFlash.dPlace_int = decimalPlace;
+                          break;
+
+                      case PROTOCOL:
+                          if (inputString[6] == MODBUS || inputString[6] == ASCII)
+                              protocol = inputString[6];
+                          else
+                              protocol = MODBUS;
+
+                          dataFlash.protocol_char = protocol;
+                          needProtocolSwitch = 1;
+                          break;
+
+                      case BAUDRATE:
+                          baudRate = (uint32_t)atoi(&inputString[6]);
+                          switch (baudRate)
+                          {
+                              case 1200: case 2400: case 4800: case 9600:
+                              case 19200: case 38400: case 57600:
+                              case 115200: case 230400: case 460800:
+                              case 921600:
+                                  break;
+                              default:
+                                  baudRate = 57600;
+                                  break;
+                          }
+
+                          dataFlash.baudRate_int = baudRate;
+                          needUartReinit = 1;
+                          break;
+
+                      case UNIT_MEASURE:
+                          memset(unitMeasure, 0, sizeof(unitMeasure));
+                          strncpy(unitMeasure, &inputString[6], sizeof(unitMeasure) - 1);
+
+                          if (strcmp(unitMeasure, "t")     != 0 &&
+                              strcmp(unitMeasure, "kN")    != 0 &&
+                              strcmp(unitMeasure, "N")     != 0 &&
+                              strcmp(unitMeasure, "kg")    != 0 &&
+                              strcmp(unitMeasure, "kgf")   != 0 &&
+                              strcmp(unitMeasure, "g")     != 0 &&
+                              strcmp(unitMeasure, "oz")    != 0 &&
+                              strcmp(unitMeasure, "lb")    != 0 &&
+                              strcmp(unitMeasure, "kg/s")  != 0 &&
+                              strcmp(unitMeasure, "t/min") != 0)
+                          {
+                              strcpy(unitMeasure, "t");
+                          }
+
+                          strcpy(dataFlash.unitMeasure, unitMeasure);
+                          break;
                   }
 
+                  /* ACK */
                   bufferTX[0] = inputString[4];
                   transmit_RS485(bufferTX, 1);
                   transmit_RS485((uint8_t *)msgOk, strlen(msgOk));
+                  HAL_Delay(10); // garante envio completo
 
+                  /* Salva na Flash */
                   dataFlash.check = FLASH_CHECK;
-
-				  memcpy(bfdataFlash, &dataFlash, sizeof(DataFlashStruct));
-				  Flash_Write_Data(ADDR_FLASH_SECTOR_4, (uint32_t *)bfdataFlash, sizeof(DataFlashStruct));
-
+                  memcpy(bfdataFlash, &dataFlash, sizeof(DataFlashStruct));
+                  Flash_Write_Data(ADDR_FLASH_SECTOR_4,
+                                   (uint32_t *)bfdataFlash,
+                                   sizeof(DataFlashStruct));
               }
           }
 
-          memset(inputString, 0x0, sizeof(inputString));
+          /* Limpeza */
+          memset(inputString, 0, sizeof(inputString));
           stringComplete = false;
-      }
+
+          if (needUartReinit || needProtocolSwitch)
+          {
+              HAL_UART_DeInit(&huart1);
+              MX_USART1_UART_Init();
+
+              if (protocol == MODBUS)
+                  HAL_UARTEx_ReceiveToIdle_IT(&huart1, RxData, 256);
+              else
+                  HAL_UARTEx_ReceiveToIdle_IT(&huart1, bufferRX, BUFFERS_RX_SIZE);
+
+              needUartReinit = 0;
+              needProtocolSwitch = 0;
+          }
 
 
       /* ================= MODBUS DISPLAY ================= */
@@ -1027,6 +1068,7 @@ int main(void)
             timer = HAL_GetTick();
           }
         }
+      }
       }
     }
   }
